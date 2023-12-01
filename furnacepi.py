@@ -1,6 +1,6 @@
 from flask import Flask, render_template, jsonify
 import RPi.GPIO as GPIO
-import max6675
+from max6675 import MAX6675
 import time
 from threading import Thread, Lock
 import subprocess
@@ -23,7 +23,7 @@ PUSH_BUTTON_PIN = 13
 CS_PIN = 22
 SCK_PIN = 18
 SO_PIN = 16
-UNITS = 1  # 1 for Celsius
+UNITS = 'C'
 
 # Temperature thresholds, CAUTION: these are unique to my furnace and probe, set up your own thresholds
 TEMP_STARTUP_HIGH = 175  # wood loaded, taper off this temp
@@ -33,10 +33,10 @@ TEMP_THRESHOLD_MIDDLE = 180
 TEMP_THRESHOLD_LOW = 115
 
 # Startup bounce cycles, how many times to bounce between startup high and low
-STARTUP_BOUNCE_CYCLES = 3
+STARTUP_BOUNCE_CYCLES = 1
 
 # Debounce time in milliseconds for the startup button
-DEBOUNCE_TIME = 200
+DEBOUNCE_TIME = 500
 
 # Global variables
 overfire_condition = False
@@ -55,8 +55,7 @@ OverfireShutoff = None
 # Flask app setup
 app = Flask(__name__)
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-
+log.setLevel(logging.WARNING)
 
 # Relay control class
 class RelayControl:
@@ -89,6 +88,9 @@ def initialize_gpio():
 
 # interrupt callback for startup button, set global variable
 def button_callback(channel):
+    # important to stick a 0.1uF capacitor between the switch terminals, the rpi library
+    # doesn't actually debnc the switch, it just ignores further events for bouncetime
+    log.warning("Button pressed")
     global button_pressed
     button_pressed = True
 
@@ -98,22 +100,24 @@ def is_relay_active(pin):
     return GPIO.input(pin) == GPIO.LOW
 
 
-# Set MAX6675 module pins
-max6675.set_pin(CS_PIN, SCK_PIN, SO_PIN, UNITS)
+sensor = MAX6675(CS_PIN, SCK_PIN, SO_PIN, UNITS)
 
 
 # Poll temperature, this is kept in a separate thread to avoid blocking the main thread
 def poll_temperature():
-    print("Starting temperature polling thread...")
+    log.info("Starting temperature polling thread...")
     global current_temperature, last_poll_time
     while True:
         temperatures = []
         for _ in range(3):
-            temp = max6675.read_temp(CS_PIN)
-            if temp is not None and temp >= 0:
-                temperatures.append(temp)
-            # can we poll in millisecond intervals?
-            time.sleep(0.5)  # Sleep between polls
+            try:
+                temp = sensor.read_temperature()  # Use the MAX6675 class method
+            except IOError as e:
+                log.error(f"Error reading temperature: {e}")
+                continue
+
+            temperatures.append(temp)
+            time.sleep(0.1)  # Sleep between polls
 
         with temperature_lock:  # Ensure thread-safe updates to the global variable
             if temperatures:
@@ -122,7 +126,7 @@ def poll_temperature():
                 current_temperature = None
             last_poll_time = datetime.now()
 
-        time.sleep(0.5)  # Sleep before starting the next round of polling
+        time.sleep(0.1)
 
 
 # Read temperature from the global variable, thread-safe
@@ -153,7 +157,7 @@ def temperature_data():
 
 
 def run_flask_app():
-    print("Starting Flask app on a separate thread...")
+    #print("Starting Flask app on a separate thread...")
     app.run(host='0.0.0.0', port=5000)
 
 
@@ -177,10 +181,10 @@ def index():
 
 # This is fugly, probably organize control logic better but safety first, overfire takes priority
 if __name__ == "__main__":
-    print('\033[1;32m' + "Starting furnace monitor..." + '\033[0m')
+    #print('\033[1;32m' + "Starting furnace monitor..." + '\033[0m')
     # GPIO initialization
     initialize_gpio()
-    print('\033[1;32m' + "GPIO initialized." + '\033[0m')
+    #print('\033[1;32m' + "GPIO initialized." + '\033[0m')
     # Start the temperature polling thread
     temperature_thread = Thread(target=poll_temperature)
     temperature_thread.daemon = True  # Daemonize thread
@@ -191,7 +195,7 @@ if __name__ == "__main__":
     flask_thread.start()
 
     try:
-        print('\033[1;32m' + "Initiating main overfire protection and creosote protection" + '\033[0m')
+        log.warning('\033[1;32m' + "Furnace controller started" + '\033[0m')
         while True:
             with temperature_lock:  # Use the lock to safely access current_temperature
                 if current_temperature is not None:
@@ -225,7 +229,7 @@ if __name__ == "__main__":
                     elif current_temperature < TEMP_THRESHOLD_LOW and not force_heat_active:
                         ForceHeat.on()
                         force_heat_active = True
-                    elif force_heat_active and current_temperature >= TEMP_THRESHOLD_LOW + 20:
+                    elif force_heat_active and current_temperature >= TEMP_THRESHOLD_LOW + 15:
                         ForceHeat.off()
                         force_heat_active = False
             time.sleep(2)  # Polling delay

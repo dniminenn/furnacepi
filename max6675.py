@@ -1,65 +1,85 @@
 import RPi.GPIO as GPIO
 import time
 
-GPIO.setmode(GPIO.BOARD)
-GPIO.setwarnings(False)
-
-
 # big bang SPI with MAX6675
-# CS - chip select, SCK - clock, SO - data, UNIT - 0: Celsius, 1: Kelvin, 2: Fahrenheit
-def set_pin(CS, SCK, SO, UNIT):
-    global sck
-    sck = SCK
-    global so
-    so = SO
-    global unit
-    unit = UNIT
+class MAX6675:
+    def __init__(self, CS, SCK, SO, unit='C'):
+        self.CS = CS
+        self.SCK = SCK
+        self.SO = SO
+        self.unit = unit
 
-    GPIO.setup(CS, GPIO.OUT, initial=GPIO.HIGH)
-    GPIO.setup(SCK, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(SO, GPIO.IN)
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setwarnings(False)
 
+        GPIO.setup(self.CS, GPIO.OUT, initial=GPIO.HIGH)
+        GPIO.setup(self.SCK, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup(self.SO, GPIO.IN)
 
-# read temperature from MAX6675, CS is chip select pin
-# it is normally high, when read data, it is low, can multiplex with other SPI device
-def read_temp(cs_no):
-    GPIO.output(cs_no, GPIO.LOW)
-    time.sleep(0.002)
-    GPIO.output(cs_no, GPIO.HIGH)
-    time.sleep(0.22)
+    def read_temperature(self):
+        self._select_chip()
+        self._deselect_chip()
 
-    GPIO.output(cs_no, GPIO.LOW)
-    GPIO.output(sck, GPIO.HIGH)
-    time.sleep(0.001)
-    GPIO.output(sck, GPIO.LOW)
-    temperature_value = 0
-    for i in range(11, -1, -1):
-        GPIO.output(sck, GPIO.HIGH)
-        temperature_value = temperature_value + (GPIO.input(so) * (2 ** i))
-        GPIO.output(sck, GPIO.LOW)
+        self._select_chip()
+        temperature_value = self._read_data()
+        self._deselect_chip()
 
-    GPIO.output(sck, GPIO.HIGH)
-    error_tc = GPIO.input(so)
-    GPIO.output(sck, GPIO.LOW)
+        return self._convert_temperature(temperature_value)
 
-    for i in range(2):
-        GPIO.output(sck, GPIO.HIGH)
+    def _select_chip(self):
+        GPIO.output(self.CS, GPIO.LOW)
+        time.sleep(0.002)
+
+    def _deselect_chip(self):
+        GPIO.output(self.CS, GPIO.HIGH)
+        time.sleep(0.22)
+
+    def _read_data(self):
+        temperature_value = 0
+
+        # Clock out the first dummy bit (D15)
+        GPIO.output(self.SCK, GPIO.HIGH)
         time.sleep(0.001)
-        GPIO.output(sck, GPIO.LOW)
+        GPIO.output(self.SCK, GPIO.LOW)
+        time.sleep(0.001)
 
-    GPIO.output(cs_no, GPIO.HIGH)
+        # Read the 12-bit temperature data (D14 to D3)
+        for i in range(11, -1, -1):
+            GPIO.output(self.SCK, GPIO.HIGH)
+            time.sleep(0.001)
+            temperature_value += GPIO.input(self.SO) << i
+            GPIO.output(self.SCK, GPIO.LOW)
+            time.sleep(0.001)
 
-    if unit == 0:
-        temp = temperature_value
-    if unit == 1:
-        temp = temperature_value * 0.25
-    if unit == 2:
-        temp = temperature_value * 0.25 * 9.0 / 5.0 + 32.0
+        # Read the thermocouple error bit (D2)
+        GPIO.output(self.SCK, GPIO.HIGH)
+        time.sleep(0.001)
+        error_tc = GPIO.input(self.SO)
+        GPIO.output(self.SCK, GPIO.LOW)
+        time.sleep(0.001)
 
-    if error_tc != 0:
-        return -cs_no
-    else:
-        return temp
+        # Clock out the last two bits (D1 and D0)
+        for _ in range(2):
+            GPIO.output(self.SCK, GPIO.HIGH)
+            time.sleep(0.001)
+            GPIO.output(self.SCK, GPIO.LOW)
+            time.sleep(0.001)
 
+        # Check for thermocouple error
+        if error_tc != 0:
+            raise IOError("Thermocouple Error")
 
-GPIO.cleanup()
+        return temperature_value
+
+    def _convert_temperature(self, temperature_value):
+        # Each bit increment represents 1023.75°C / 4095
+        temp_celsius = temperature_value * (1023.75 / 4095)
+
+        if self.unit == 'C':
+            return temp_celsius
+        elif self.unit == 'K':
+            return temp_celsius + 273.15  # Convert to Kelvin
+        elif self.unit == 'F':
+            return temp_celsius * 9.0 / 5.0 + 32.0  # Convert to Fahrenheit
+        else:
+            raise ValueError("Invalid unit")
